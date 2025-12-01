@@ -28,10 +28,10 @@ class ReduceSumLayer(tf.keras.layers.Layer):
 
 # ================= 設定 =================
 # ★ テストしたいファイルのパス (適宜書き換えてください)
-TARGET_FILE = "./data/fold5/other/5-51149-A-25.wav"
+TARGET_FILE = "/Users/katti/Desktop/Lab/AudioClassificationTesting/data/Ambulance-Siren01-2.wav"
 
 # ★ 学習済みモデルのパス
-MODEL_PATH = "./best.keras"  # 実際のパスに合わせてください
+MODEL_PATH = "/Users/katti/Desktop/Lab/AudioClassificationTesting/code/best.keras"  # 実際のパスに合わせてください
 
 # クラス名 (学習時の順番)
 CLASS_NAMES = ['other', 'silence', 'siren']

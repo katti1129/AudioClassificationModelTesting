@@ -241,3 +241,10 @@ model/
 
 .vscode/
 
+# ---- Python virtual environment ----
+audioenv310/
+audioenv310/**
+
+*.csv
+
+*.rtf

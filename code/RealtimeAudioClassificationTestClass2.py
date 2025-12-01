@@ -1,242 +1,247 @@
-# 事前に訓練された機械学習モデルを使用して，
-# マイクから入力されるリアルタイムの音声を分類するためのスクリプト (sounddevice版)
-
 import numpy as np
 import sounddevice as sd
 import librosa
+import tensorflow as tf
 from tensorflow.keras.models import load_model
+from tensorflow.keras import layers
 import time
 from queue import Queue
 import threading
+import sys
 
-# --- 1. 設定・パラメータ ---
-MODEL_PATH = 'model/best.keras'
+# ==========================================
+# 1. カスタムレイヤー定義
+# ==========================================
+@tf.keras.utils.register_keras_serializable()
+class ReduceSumLayer(layers.Layer):
+    def __init__(self, axis=1, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+    def call(self, inputs):
+        return tf.reduce_sum(inputs, axis=self.axis)
+    def get_config(self):
+        config = super().get_config()
+        config.update({"axis": self.axis})
+        return config
 
-CLASS_NAMES = ['siren', 'other', 'silence']
+# ==========================================
+# 2. 設定・パラメータ
+# ==========================================
+MODEL_PATH = "/Users/katti/Desktop/Lab/AudioClassificationTesting/code/best.keras"
 
-# オーディオ設定
-CHUNK = 1024 * 2
+# ★修正: 学習時のアルファベット順に合わせる (これがズレると誤検知の原因になります)
+CLASS_NAMES = ['other', 'silence', 'siren']
+
 CHANNELS = 1
 RATE = 16000
+CHUNK = 2048
 
-# 推論設定
-BUFFER_SECONDS = 1.0
+# モデル入力長 (1.5秒)
+BUFFER_SECONDS = 1.5
 BUFFER_SAMPLES = int(RATE * BUFFER_SECONDS)
-INFERENCE_INTERVAL_SECONDS = 1.0  # 1秒ごとに推論を実行
 
 # 特徴量パラメータ
 N_MELS = 128
-#N_FFT = 2048
 N_FFT = 1024
 HOP_LENGTH = 512
 
-# 推論平滑化用
-is_running = True
-prediction_history = []
-
-# ★追加: 音量ゲートのしきい値 (0.01〜0.05くらいで調整)
-#SILENCE_THRESHOLD = 0.02
-
-
-
-# --- 2. グローバル変数とキュー ---
-audio_buffer = np.zeros(BUFFER_SAMPLES, dtype=np.float32)  # float32で扱う
+# ==========================================
+# 3. グローバル変数
+# ==========================================
+audio_buffer = np.zeros(BUFFER_SAMPLES, dtype=np.float32)
 data_queue = Queue()
-run_flag = True
 buffer_lock = threading.Lock()
+is_running = True
+model = None
 
-
-
-# --- 3. オーディオ録音コールバック ---
+# ==========================================
+# 4. 音声入力コールバック
+# ==========================================
 def audio_callback(indata, frames, time_info, status):
-    """sounddeviceが別スレッドで実行する関数．マイクデータをキューに入れる"""
     if status:
-        print(status)
-    # indataはnumpy(float32, shape=(frames, channels))
+        # エラー表示は改行してしまうため、デバッグ時以外はコメントアウトしても良い
+        pass 
     data_queue.put(indata.copy())
 
+# ==========================================
+# 5. バッファ更新スレッド
+# ==========================================
+def buffer_update_thread():
+    global audio_buffer, is_running
+    print("[Info] Buffer update thread started.")
+    
+    while is_running:
+        try:
+            data_chunk = data_queue.get(timeout=1.0)
+            data_chunk = data_chunk[:, 0]
+            chunk_len = len(data_chunk)
 
-# --- 4. 前処理関数 ---
+            with buffer_lock:
+                audio_buffer = np.roll(audio_buffer, -chunk_len)
+                audio_buffer[-chunk_len:] = data_chunk
+        except:
+            continue
+
+# ==========================================
+# 6. 前処理関数
+# ==========================================
 def preprocess_for_model(audio_segment_float):
     melspec = librosa.feature.melspectrogram(
         y=audio_segment_float,
         sr=RATE,
         n_mels=N_MELS,
         n_fft=N_FFT,
-        hop_length=HOP_LENGTH
+        hop_length=HOP_LENGTH,
+        fmin=20,
+        fmax=8000,
+        power=2.0
     )
-    log_melspec = librosa.power_to_db(melspec, ref=np.max)  # shape (128, T)
+    log_melspec = librosa.power_to_db(melspec, ref=np.max)
 
-    # モデル入力に合わせて (128, 126) に切る or padする
-    if log_melspec.shape[1] > 126:
-        log_melspec = log_melspec[:, :126]
-    else:
-        pad_width = 126 - log_melspec.shape[1]
-        log_melspec = np.pad(log_melspec, ((0, 0), (0, pad_width)), mode='constant')
+    mean = np.mean(log_melspec)
+    std = np.std(log_melspec)
+    log_melspec = (log_melspec - mean) / (std + 1e-6)
 
-    # 軸を (128, 126, 1) に
+    TARGET_WIDTH = 47
+    current_width = log_melspec.shape[1]
+
+    if current_width > TARGET_WIDTH:
+        log_melspec = log_melspec[:, :TARGET_WIDTH]
+    elif current_width < TARGET_WIDTH:
+        pad_width = TARGET_WIDTH - current_width
+        log_melspec = np.pad(log_melspec, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
+
+    log_melspec = log_melspec.astype(np.float32)
     log_melspec = np.expand_dims(log_melspec, axis=-1)
-
-    #log_melspec = np.repeat(log_melspec, 3, axis=-1)
-
-    # batch次元を追加 → (1, 128, 126, 1)
     log_melspec = np.expand_dims(log_melspec, axis=0)
 
-    #print(f"生成されたメルスペクトログラムの形状: {log_melspec.shape}")
     return log_melspec
 
-
-
-# ===========================================
-# 推論スレッド（平滑化 + 遅延 + 閾値 + ヒステリシス + ★RMSゲート）
-# ===========================================
+# ==========================================
+# 7. 推論スレッド
+# ==========================================
 def inference_thread():
-    global is_running, prediction_history, audio_buffer, model
+    global is_running, audio_buffer, model
+    print("[Info] Inference thread started.")
 
+    # クラスのインデックスを取得（表示用）
+    idx_other   = CLASS_NAMES.index('other')
+    idx_silence = CLASS_NAMES.index('silence')
+    idx_siren   = CLASS_NAMES.index('siren')
+
+    # 平滑化
     SMOOTHING_WINDOW = 5
-
-    # しきい値 & ヒステリシス用
-    SIREN_THRESHOLD = 0.97      # 97% 未満は siren確定としない
-    SIREN_ON_COUNT  = 3         # 3連続でON確定
-    SIREN_OFF_COUNT = 3         # 3連続でOFF確定
-
-    # 状態管理
-    siren_on_counter  = 0
-    siren_off_counter = 0
-    siren_active = False  # 現在サイレン状態中か
-
     prediction_history = []
+    
+    # ヒステリシス
+    SIREN_THRESHOLD = 0.97
+    SIREN_ON_COUNT = 3
+    SIREN_OFF_COUNT = 3
+    
+    siren_on_counter = 0
+    siren_off_counter = 0
+    siren_active = False
 
     while is_running:
-        if len(audio_buffer) == BUFFER_SAMPLES:
+        with buffer_lock:
+            current_buffer = np.array(audio_buffer, dtype=np.float32)
 
-            # ===== 入力コピー =====
-            buffer_copy = np.array(audio_buffer, dtype=np.float32)
-
-            # ===== 遅延計測開始 =====
-            start_time = time.time()
-
-            # ===== ★追加: 音量(RMS)チェック =====
-            rms = np.sqrt(np.mean(buffer_copy**2))
-
-            if rms < SILENCE_THRESHOLD:
-                # 音が小さすぎる場合 -> 強制的に Silence とする
-                # CLASS_NAMES = ['siren', 'other', 'silence'] なので [0, 0, 1]
-                raw_pred = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-                
-                # 計算負荷を下げるため，この回は前処理・推論をスキップする
-                # print(f"Low Volume: {rms:.4f}") # デバッグ用
-            else:
-                # 音が十分ある場合 -> 通常通り AI に推論させる
-                
-                # ===== 前処理 =====
-                processed_data = preprocess_for_model(buffer_copy)
-
-                # ===== 生予測 =====
-                raw_pred = model.predict(processed_data, verbose=0)[0]
-
-
-            # ===== 平滑化 (強制Silenceの場合も履歴に含めることで滑らかに移行する) =====
-            prediction_history.append(raw_pred)
-            if len(prediction_history) > SMOOTHING_WINDOW:
-                prediction_history.pop(0)
-            smoothed_preds = np.mean(prediction_history, axis=0)
-
-            # ===== ヒステリシス判定 =====
-            siren_prob = smoothed_preds[CLASS_NAMES.index("siren")]
-
-            if siren_prob >= SIREN_THRESHOLD:
-                # sirenぽい結果が続いている
-                siren_on_counter += 1
-                siren_off_counter = 0
-                if siren_on_counter >= SIREN_ON_COUNT:
-                    siren_active = True
-            else:
-                # sirenらしくない結果が続いている
-                siren_off_counter += 1
-                siren_on_counter = 0
-                if siren_off_counter >= SIREN_OFF_COUNT:
-                    siren_active = False
-
-            # ===== 表示用クラス確定 =====
-            if siren_active:
-                predicted_class = "siren"
-                confidence = siren_prob * 100
-            else:
-                # sirenがアクティブでない場合は他クラス最大
-                predicted_class_id = np.argmax(smoothed_preds)
-                predicted_class = CLASS_NAMES[predicted_class_id]
-                confidence = smoothed_preds[predicted_class_id] * 100
-
-            # ===== 遅延測定完了 =====
-            latency = time.time() - start_time
-
-            # ===== 1行上書き表示 =====
-            # RMS値も表示しておくと調整しやすいです
-            print(
-                f"\rsiren: {smoothed_preds[0]*100:.2f}% | "
-                f"other: {smoothed_preds[1]*100:.2f}% | "
-                f"silence: {smoothed_preds[2]*100:.2f}% "
-                f"| Vol: {rms:.3f} "  # ★音量を表示
-                f"| 状態: {'ON' if siren_active else 'OFF'} "
-                f"| 確定: {predicted_class} ({confidence:.2f}%) "
-                f"| 遅延: {latency:.3f} 秒 ",
-                end="",
-                flush=True
-            )
-
-        else:
-            time.sleep(0.01)
-
-
-
-# --- 6. メイン処理 ---
-def main():
-    global audio_buffer, run_flag,model
-
-    print("モデルを読み込んでいます...")
-    global model
-    model = load_model(MODEL_PATH)
-    print("モデルの読み込み完了．")
-
-    # sounddevice の入力ストリーム開始
-    with sd.InputStream(
-        channels=CHANNELS,
-        samplerate=RATE,
-        blocksize=CHUNK,
-        dtype='float32',
-        callback=audio_callback
-    ):
-        print("\nリアルタイム分類を開始しました... (Ctrl+Cで終了)")
-
-        # 推論スレッド開始
-        infer_thread = threading.Thread(target=inference_thread)
-        infer_thread.daemon = True
-        infer_thread.start()
+        start_time = time.time()
+        rms = np.sqrt(np.mean(current_buffer**2))
 
         try:
-            while run_flag:
-                data_chunk = data_queue.get()
-                if data_chunk is None:
-                    break
+            processed_data = preprocess_for_model(current_buffer)
+            raw_pred = model.predict(processed_data, verbose=0)[0]
+        except Exception as e:
+            continue
 
-                data_chunk = data_chunk[:, 0]  # mono取り出し
+        prediction_history.append(raw_pred)
+        if len(prediction_history) > SMOOTHING_WINDOW:
+            prediction_history.pop(0)
+        smoothed_preds = np.mean(prediction_history, axis=0)
 
-                with buffer_lock:
-                    chunk_len = len(data_chunk)
-                    audio_buffer = np.roll(audio_buffer, -chunk_len)
-                    audio_buffer[-chunk_len:] = data_chunk
+        # 判定ロジック
+        siren_prob = smoothed_preds[idx_siren]
 
-                time.sleep(0.01)
+        if siren_prob >= SIREN_THRESHOLD:
+            siren_on_counter += 1
+            siren_off_counter = 0
+            if siren_on_counter >= SIREN_ON_COUNT:
+                siren_active = True
+        else:
+            siren_off_counter += 1
+            siren_on_counter = 0
+            if siren_off_counter >= SIREN_OFF_COUNT:
+                siren_active = False
 
-        except KeyboardInterrupt:
-            print("\nCtrl+Cを検出しました．プログラムを終了します．")
-        finally:
-            run_flag = False
-            if infer_thread.is_alive():
-                infer_thread.join(timeout=1)
-            print("終了しました．")
+        if siren_active:
+            final_class = "siren"
+            confidence = siren_prob * 100
+        else:
+            pred_id = np.argmax(smoothed_preds)
+            final_class = CLASS_NAMES[pred_id]
+            confidence = smoothed_preds[pred_id] * 100
 
-is_running = True
+        latency = time.time() - start_time
+
+        # ★修正: \r を使って行頭に戻り、その場で更新する
+        # 文字列末尾にスペースを入れて、前の長い文字が残らないようにする
+        print(
+            f"\rSiren: {smoothed_preds[idx_siren]*100:5.1f}% | "
+            f"Other: {smoothed_preds[idx_other]*100:5.1f}% | "
+            f"Silence: {smoothed_preds[idx_silence]*100:5.1f}% "
+            f"| Vol: {rms:.3f} "
+            f"| 判定: {final_class:7s} ({confidence:5.1f}%) "
+            f"| 遅延: {latency:.3f}s    ", # ←末尾に空白パディング
+            end="",
+            flush=True
+        )
+
+        time.sleep(0.1)
+
+# ==========================================
+# 8. メイン関数
+# ==========================================
+def main():
+    global model, is_running
+
+    print("モデルを読み込んでいます...")
+    try:
+        model = load_model(MODEL_PATH, custom_objects={'ReduceSumLayer': ReduceSumLayer})
+        print("モデル読み込み完了。")
+    except Exception as e:
+        print(f"[Fatal Error] {e}")
+        sys.exit(1)
+
+    try:
+        with sd.InputStream(
+            channels=CHANNELS,
+            samplerate=RATE,
+            blocksize=CHUNK,
+            dtype='float32',
+            callback=audio_callback
+        ):
+            print("\nリアルタイム分類を開始しました (Ctrl+Cで終了)...")
+
+            t_update = threading.Thread(target=buffer_update_thread)
+            t_update.daemon = True
+            t_update.start()
+
+            t_infer = threading.Thread(target=inference_thread)
+            t_infer.daemon = True
+            t_infer.start()
+
+            while True:
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n\n停止します...")
+    except Exception as e:
+        print(f"\n[Error] {e}")
+    finally:
+        is_running = False
+        time.sleep(0.5)
+        print("終了しました。")
+
 if __name__ == '__main__':
     main()
