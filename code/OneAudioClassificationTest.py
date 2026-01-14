@@ -28,7 +28,7 @@ class ReduceSumLayer(tf.keras.layers.Layer):
 
 # ================= 設定 =================
 # ★ テストしたいファイルのパス (適宜書き換えてください)
-TARGET_FILE = "/Users/katti/Desktop/Lab/AudioClassificationTesting/data/Ambulance-Siren01-2.wav"
+TARGET_FILE = "/Users/katti/Desktop/Lab/AudioClassificationTesting/data/audio_20260114_030714.wav"
 
 # ★ 学習済みモデルのパス
 MODEL_PATH = "/Users/katti/Desktop/Lab/AudioClassificationTesting/code/best.keras"  # 実際のパスに合わせてください
@@ -38,7 +38,7 @@ CLASS_NAMES = ['other', 'silence', 'siren']
 
 # 学習時と同じパラメータ (TrainCRNN_9Fold.pyより)
 SAMPLE_RATE = 16000
-DURATION = 1.5
+DURATION = 1.0
 WIN_SAMPLES = int(SAMPLE_RATE * DURATION) # 24000
 N_MELS = 128
 N_FFT = 1024
