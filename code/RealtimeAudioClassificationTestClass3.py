@@ -32,7 +32,7 @@ class ReduceSumLayer(layers.Layer):
 # ==========================================
 MODEL_PATH = "/Users/katti/Desktop/Lab/AudioClassificationTesting/code/best.keras"
 
-# ★修正: 学習時のアルファベット順に合わせる (これがズレると誤検知の原因になります)
+# 学習時のアルファベット順に合わせる
 CLASS_NAMES = ['other', 'silence', 'siren']
 
 CHANNELS = 1
