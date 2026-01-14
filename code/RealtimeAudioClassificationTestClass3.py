@@ -49,7 +49,7 @@ N_FFT = 1024
 HOP_LENGTH = 512
 
 # RMS 無音判定閾値（環境に応じて調整）
-RMS_THRESHOLD = 0.001
+RMS_THRESHOLD = 0.012
 
 # ==========================================
 # 3. グローバル変数
@@ -169,12 +169,62 @@ def inference_thread():
                 f"Silence:100.0% "
                 f"| Vol: {rms:.3f} "
                 f"| 判定: silence  (100.0%) "
-                f"| 遅延: {latency:.3f}s    ",
+                f"| 遅延: {latency:.3f}s    "
+                f"{rms}",
                 end="",
                 flush=True
             )
             time.sleep(0.1)
             continue
+        # ===== 閾値を超えたらここから推論 =====
+        processed_data = preprocess_for_model(current_buffer)
+        raw_pred = model.predict(processed_data, verbose=0)[0]
+
+        # --- 平滑化 ---
+        prediction_history.append(raw_pred)
+        if len(prediction_history) > SMOOTHING_WINDOW:
+            prediction_history.pop(0)
+        smoothed_preds = np.mean(prediction_history, axis=0)
+
+        # --- クラス確率 ---
+        siren_prob = smoothed_preds[idx_siren]
+
+        # --- サイレンのヒステリシス判定 ---
+        if siren_prob >= SIREN_THRESHOLD:
+            siren_on_counter += 1
+            siren_off_counter = 0
+            if siren_on_counter >= SIREN_ON_COUNT:
+                siren_active = True
+        else:
+            siren_off_counter += 1
+            siren_on_counter = 0
+            if siren_off_counter >= SIREN_OFF_COUNT:
+                siren_active = False
+
+        # --- 最終判定 ---
+        if siren_active:
+            final_class = "siren"
+            confidence = siren_prob * 100
+        else:
+            pred_id = np.argmax(smoothed_preds)
+            final_class = CLASS_NAMES[pred_id]
+            confidence = smoothed_preds[pred_id] * 100
+
+        latency = time.time() - start_time
+
+        print(
+            f"\rSiren: {smoothed_preds[idx_siren]*100:5.1f}% | "
+            f"Other: {smoothed_preds[idx_other]*100:5.1f}% | "
+            f"Silence: {smoothed_preds[idx_silence]*100:5.1f}% "
+            f"| Vol: {rms:.3f} "
+            f"| 判定: {final_class:7s} ({confidence:5.1f}%) "
+            f"| 遅延: {latency:.3f}s    ",
+            end="",
+            flush=True
+        )
+
+        time.sleep(0.1)
+
 
 
 # ==========================================
