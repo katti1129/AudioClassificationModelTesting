@@ -163,16 +163,13 @@ def inference_thread():
         if rms < RMS_THRESHOLD:
             final_class = "silence"
             confidence = 100.0
-            latency = time.time() - start_time
+            #latency = time.time() - start_time
 
             print(
                 f"\rSiren:   0.0% | "
                 f"Other:   0.0% | "
                 f"Silence:100.0% "
-                f"| Vol: {rms:.3f} "
-                f"| 判定: silence  (100.0%) "
-                f"| 遅延: {latency:.3f}s    "
-                f"{rms}",
+                f"| Vol: {rms:.3f}    ",
                 end="",
                 flush=True
             )
@@ -218,7 +215,6 @@ def inference_thread():
             f"\rSiren: {smoothed_preds[idx_siren]*100:5.1f}% | "
             f"Other: {smoothed_preds[idx_other]*100:5.1f}% "
             f"| Vol: {rms:.3f} "
-            f"| 判定: {final_class:7s} ({confidence:5.1f}%) "
             f"| 遅延: {latency:.3f}s    ",
             end="",
             flush=True
