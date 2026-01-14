@@ -1,5 +1,6 @@
 #推論結果をリアルタイムで表示する音声分類プログラム
 #vol.判定ありバージョン
+#other/sirenの2クラス分類
 
 import numpy as np
 import sounddevice as sd
@@ -33,7 +34,7 @@ class ReduceSumLayer(layers.Layer):
 MODEL_PATH = "/Users/katti/Desktop/Lab/AudioClassificationTesting/code/best.keras"
 
 # 学習時のアルファベット順に合わせる
-CLASS_NAMES = ['other', 'silence', 'siren']
+CLASS_NAMES = ['other', 'siren']
 
 CHANNELS = 1
 RATE = 16000
@@ -108,7 +109,8 @@ def preprocess_for_model(audio_segment_float):
     std = np.std(log_melspec)
     log_melspec = (log_melspec - mean) / (std + 1e-6)
 
-    TARGET_WIDTH = 47
+    #TARGET_WIDTH = 47 1.5sの場合
+    TARGET_WIDTH = 32  # 1.0sの場合
     current_width = log_melspec.shape[1]
 
     if current_width > TARGET_WIDTH:
@@ -132,7 +134,7 @@ def inference_thread():
 
     # クラスのインデックスを取得（表示用）
     idx_other   = CLASS_NAMES.index('other')
-    idx_silence = CLASS_NAMES.index('silence')
+    #idx_silence = CLASS_NAMES.index('silence')
     idx_siren   = CLASS_NAMES.index('siren')
 
     # 平滑化
@@ -214,8 +216,7 @@ def inference_thread():
 
         print(
             f"\rSiren: {smoothed_preds[idx_siren]*100:5.1f}% | "
-            f"Other: {smoothed_preds[idx_other]*100:5.1f}% | "
-            f"Silence: {smoothed_preds[idx_silence]*100:5.1f}% "
+            f"Other: {smoothed_preds[idx_other]*100:5.1f}% "
             f"| Vol: {rms:.3f} "
             f"| 判定: {final_class:7s} ({confidence:5.1f}%) "
             f"| 遅延: {latency:.3f}s    ",
