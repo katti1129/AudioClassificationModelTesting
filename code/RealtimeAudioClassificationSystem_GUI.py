@@ -71,6 +71,7 @@ RMS_THRESHOLD = 0.012
 # ReSpeaker USB Mic Array v2.0
 RESPEAKER_VENDOR_ID = 0x2886
 RESPEAKER_PRODUCT_ID = 0x0018
+RESPEAKER_AUDIO_NAME = "ReSpeaker"
 
 # ==========================================
 # 3. グローバル変数
@@ -120,8 +121,50 @@ def buffer_update_thread():
             continue
 
 # ==========================================
-# 6. ReSpeaker 初期化・DOA取得
+# 6. ReSpeaker 初期化・音声入力デバイス選択・DOA取得
 # ==========================================
+def find_respeaker_audio_device():
+    """sounddeviceからReSpeakerの入力デバイス番号を取得する。"""
+    devices = sd.query_devices()
+    input_devices = []
+    matching_devices = []
+
+    for index, device in enumerate(devices):
+        if int(device["max_input_channels"]) <= 0:
+            continue
+
+        device_name = str(device["name"])
+        input_devices.append(f"  [{index}] {device_name}")
+
+        if RESPEAKER_AUDIO_NAME.casefold() in device_name.casefold():
+            matching_devices.append((index, device))
+
+    if not matching_devices:
+        available = "\n".join(input_devices) or "  （入力デバイスなし）"
+        raise RuntimeError(
+            "ReSpeakerの音声入力デバイスが見つかりません。\n"
+            f"利用可能な入力デバイス:\n{available}"
+        )
+
+    # 同名候補が複数ある場合は、利用可能な入力チャンネル数が多いものを選ぶ。
+    device_index, device_info = max(
+        matching_devices,
+        key=lambda item: int(item[1]["max_input_channels"]),
+    )
+
+    sd.check_input_settings(
+        device=device_index,
+        channels=CHANNELS,
+        dtype="float32",
+        samplerate=RATE,
+    )
+    print(
+        f"ReSpeaker Audio Input: [{device_index}] {device_info['name']} "
+        f"({RATE} Hz, {CHANNELS} ch)"
+    )
+    return device_index
+
+
 def initialize_respeaker():
     global current_direction
 
@@ -187,21 +230,21 @@ def doa_to_direction_label(direction):
     angle = direction % 360
 
     if angle >= 337.5 or angle < 22.5:
-        return "← Left"
+        return "← 左"
     elif angle < 67.5:
-        return "↙ Rear Left"
+        return "↙ 左下"
     elif angle < 112.5:
-        return "↓ Rear"
+        return "↓ 下"
     elif angle < 157.5:
-        return "↖ Front Left"
+        return "↘ 右下"
     elif angle < 202.5:
-        return "→ Right"
+        return "→ 右"
     elif angle < 247.5:
-        return "↗ Front Right"
+        return "↗ 右上"
     elif angle < 292.5:
-        return "↑ Front"
+        return "↑ 前"
     else:
-        return "↘ Rear Right"
+        return "↖ 左上"
 
 def update_gui_state(final_class, confidence, rms, latency):
     global gui_final_class, gui_confidence, gui_rms, gui_latency
@@ -281,15 +324,15 @@ class NotificationWindow(QWidget):
         grid.setVerticalSpacing(5)
         layout.addLayout(grid)
 
-        self.direction_title = QLabel("Direction")
+        self.direction_title = QLabel("方向")
         self.direction_value = QLabel("Unknown")
-        self.confidence_title = QLabel("Confidence")
+        self.confidence_title = QLabel("信頼値")
         self.confidence_value = QLabel("0.0 %")
-        self.status_title = QLabel("Status")
-        self.status_value = QLabel("LISTENING")
-        self.volume_title = QLabel("Volume")
+        self.status_title = QLabel("状態")
+        self.status_value = QLabel("待機中")
+        self.volume_title = QLabel("音量")
         self.volume_value = QLabel("0.000")
-        self.inference_title = QLabel("Inference")
+        self.inference_title = QLabel("推論時間")
         self.inference_value = QLabel("0.0 ms")
 
         title_font = QFont("Arial", 12, QFont.Bold)
@@ -350,11 +393,11 @@ class NotificationWindow(QWidget):
             direction_label = f"{direction_label}  {direction % 360}°"
 
         if final_class == "siren":
-            status = "DETECTED"
+            status = "サイレンです！注意してください"
         elif final_class == "silence":
-            status = "SILENCE"
+            status = "無音"
         else:
-            status = "MONITORING"
+            status = "その他"
 
         self.direction_value.setText(direction_label)
         self.confidence_value.setText(f"{confidence:.1f} %")
@@ -524,6 +567,15 @@ def main():
         sys.exit(1)
 
     mic = initialize_respeaker()
+    if mic is None:
+        print("[Fatal Error] ReSpeakerのDOA機能を初期化できませんでした。")
+        sys.exit(1)
+
+    try:
+        respeaker_audio_device = find_respeaker_audio_device()
+    except Exception as e:
+        print(f"[Fatal Error] ReSpeakerの音声入力を使用できません: {e}")
+        sys.exit(1)
 
     def stop_threads():
         global is_running
@@ -533,6 +585,7 @@ def main():
 
     try:
         with sd.InputStream(
+            device=respeaker_audio_device,
             channels=CHANNELS,
             samplerate=RATE,
             blocksize=CHUNK,
